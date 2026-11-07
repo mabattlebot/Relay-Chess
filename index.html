@@ -49,6 +49,7 @@ select:focus,input:focus{border-color:var(--blue)}
 .sq.leg::after{content:"";position:absolute;width:30%;height:30%;border-radius:50%;background:rgba(20,24,30,.28)}
 .sq.cap::after{content:"";position:absolute;inset:0;background:radial-gradient(circle,transparent 58%,rgba(20,24,30,.28) 60%)}
 .sq:hover{filter:brightness(1.06)}
+.board{touch-action:none}.sq.hov{box-shadow:inset 0 0 0 3px rgba(255,255,255,.6)}
 .pc{position:relative;z-index:1;line-height:1;pointer-events:none;font-family:"Segoe UI Symbol","Noto Sans Symbols 2","Apple Symbols","DejaVu Sans",sans-serif}
 img.pc{width:100%;height:100%;filter:drop-shadow(0 2px 2px rgba(0,0,0,.28))}
 .modal button.pbtn{width:64px;height:64px;padding:4px}.pbtn .pc{position:static}
@@ -366,7 +367,7 @@ function render() {
     if (p) d.appendChild(pieceEl(p.color, p.type));
     if (dr === 7) { const f = document.createElement("span"); f.className = "co f"; f.textContent = "abcdefgh"[c]; d.appendChild(f); }
     if (dc === 0) { const f = document.createElement("span"); f.className = "co r"; f.textContent = 8 - r; d.appendChild(f); }
-    d.onclick = () => click(sq); bd.appendChild(d);
+    d.dataset.sq = sq; d.onclick = () => click(sq); bd.appendChild(d);
   }
   const top = flip ? "w" : "b", bot = opp(top);
   [["T", top], ["B", bot]].forEach(([k, c]) => {
@@ -537,6 +538,39 @@ $("newBtn").onclick = () => mode === "online" ? rematch() : mode === "bot" ? sta
 const copy = (txt, btn, lab) => navigator.clipboard.writeText(txt).then(() => { btn.textContent = "Copied!"; setTimeout(() => btn.textContent = lab, 1400); }).catch(() => btn.textContent = txt);
 $("copyCode").onclick = () => roomCode && copy(roomCode, $("copyCode"), "Copy code");
 $("copyLink").onclick = () => roomCode && copy(location.href.split("?")[0] + "?room=" + roomCode, $("copyLink"), "Copy link");
+
+/* ---------------- drag and drop (click-to-move still works) ---------------- */
+let drag = null;
+const sqAt = (x, y) => { const el = document.elementFromPoint(x, y), c = el && el.closest ? el.closest(".sq") : null; return c ? c.dataset.sq : null; };
+function moveGhost(e) {
+  drag.ghost.style.transform = "translate(" + (e.clientX - drag.w / 2) + "px," + (e.clientY - drag.h / 2) + "px) scale(1.12)";
+  const to = sqAt(e.clientX, e.clientY);
+  document.querySelectorAll(".sq.hov").forEach(x => x.classList.remove("hov"));
+  if (to && to !== drag.sq && tg.some(m => m.to === to)) $("board").querySelector('.sq[data-sq="' + to + '"]').classList.add("hov");
+}
+$("board").addEventListener("pointerdown", e => {
+  if (e.button > 0 || !canMove() || botBusy) return;
+  const cell = e.target.closest(".sq"); if (!cell) return;
+  const sq = cell.dataset.sq, p = g.get(sq);
+  if (!p || p.color !== g.turn() || S.used.includes(sq)) return;       // only pick up your own movable pieces
+  e.preventDefault();
+  sel = sq; tg = g.moves({square: sq, verbose: true}); render();
+  const piece = $("board").querySelector('.sq[data-sq="' + sq + '"] .pc'); if (!piece) return;
+  const r = piece.getBoundingClientRect(), ghost = piece.cloneNode(true);
+  Object.assign(ghost.style, {position: "fixed", left: "0", top: "0", width: r.width + "px", height: r.height + "px", zIndex: 30, pointerEvents: "none", margin: 0});
+  piece.style.opacity = ".3"; document.body.appendChild(ghost);
+  drag = {sq, ghost, w: r.width, h: r.height}; moveGhost(e);
+});
+document.addEventListener("pointermove", e => { if (drag) moveGhost(e); });
+function endDrag(e, cancel) {
+  if (!drag) return;
+  const d = drag; drag = null; d.ghost.remove();
+  document.querySelectorAll(".sq.hov").forEach(x => x.classList.remove("hov"));
+  const to = cancel ? null : sqAt(e.clientX, e.clientY);
+  if (to && to !== d.sq && tg.some(m => m.to === to)) doMove(d.sq, to); else render();   // dropped on own square: stays selected
+}
+document.addEventListener("pointerup", e => endDrag(e, false));
+document.addEventListener("pointercancel", e => endDrag(e, true));
 
 $("navRules").onclick = () => { const d = $("rulesCard"); d.open = true; d.scrollIntoView({behavior: "smooth"}); };
 if (typeof Chess !== "function") document.body.innerHTML = "<p style='padding:30px'>Chess library failed to load. Check your connection and reload.</p>";
