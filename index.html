@@ -117,7 +117,7 @@ img.pc{width:100%;height:100%;filter:drop-shadow(0 2px 2px rgba(0,0,0,.28))}
         <div><div class="lbl">Time control</div><select id="tc"><option value="0">Unlimited</option><option value="1+0">1 + 0 Bullet</option><option value="3+2">3 + 2 Blitz</option><option value="5+0">5 + 0 Blitz</option><option value="10+0">10 + 0 Rapid</option><option value="15+10">15 + 10 Rapid</option></select></div>
         <div><div class="lbl">Play as</div><select id="col"><option value="w">White</option><option value="b">Black</option><option value="r">Random</option></select></div>
       </div>
-      <div id="botOpt"><div class="lbl">Bot strength</div><select id="lvl"><option value="1">Easy</option><option value="2" selected>Medium</option><option value="3">Hard</option></select></div>
+      <div id="botOpt"><div class="lbl">Bot strength</div><select id="lvl"><option value="1">Easy</option><option value="2" selected>Medium</option><option value="3">Hard</option><option value="4">Expert</option></select></div>
       <button class="primary" id="startBtn">Start game</button>
     </div>
   </section>
@@ -143,6 +143,203 @@ img.pc{width:100%;height:100%;filter:drop-shadow(0 2px 2px rgba(0,0,0,.28))}
 </div>
 <div class="modal hidden" id="promo"><div>Promote to<div class="row" id="promoRow"></div></div></div>
 
+<script type="text/plain" id="engineSrc">
+// Relay Chess engine: alpha-beta + quiescence + iterative deepening. Runs in a Web Worker.
+// Rules: capture => bonus move by a different piece (optional), check ends the turn.
+"use strict";
+const MATE = 100000, INF = 1e9, TIMEOUT = {};
+const VAL = {P: 100, N: 320, B: 330, R: 500, Q: 900, K: 0, p: 100, n: 320, b: 330, r: 500, q: 900, k: 0};
+const PHASE = {N: 1, B: 1, R: 2, Q: 4, n: 1, b: 1, r: 2, q: 4};
+const on = (r, c) => r >= 0 && r < 8 && c >= 0 && c < 8;
+const NT = [], KT = [], OR = [], DR = [], PA = [[], []];
+for (let s = 0; s < 64; s++) {
+  const r = s >> 3, c = s & 7;
+  NT[s] = []; KT[s] = []; OR[s] = []; DR[s] = []; PA[0][s] = []; PA[1][s] = [];
+  for (const [a, b] of [[1, 2], [2, 1], [-1, 2], [-2, 1], [1, -2], [2, -1], [-1, -2], [-2, -1]]) if (on(r + a, c + b)) NT[s].push((r + a) * 8 + c + b);
+  for (let a = -1; a < 2; a++) for (let b = -1; b < 2; b++) if ((a || b) && on(r + a, c + b)) KT[s].push((r + a) * 8 + c + b);
+  for (const [a, b] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const ray = []; let rr = r + a, cc = c + b; while (on(rr, cc)) { ray.push(rr * 8 + cc); rr += a; cc += b; } if (ray.length) OR[s].push(ray); }
+  for (const [a, b] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) { const ray = []; let rr = r + a, cc = c + b; while (on(rr, cc)) { ray.push(rr * 8 + cc); rr += a; cc += b; } if (ray.length) DR[s].push(ray); }
+  for (const b of [-1, 1]) { if (on(r + 1, c + b)) PA[1][s].push((r + 1) * 8 + c + b); if (on(r - 1, c + b)) PA[0][s].push((r - 1) * 8 + c + b); }
+}
+const CM = new Array(64).fill(15); CM[60] = 12; CM[63] = 14; CM[56] = 13; CM[4] = 3; CM[7] = 11; CM[0] = 7;
+const rep = (row, n) => Array(n).fill(row).flat();
+const PST = {
+  P: [0,0,0,0,0,0,0,0, 50,50,50,50,50,50,50,50, 10,10,20,30,30,20,10,10, 5,5,10,25,25,10,5,5, 0,0,0,20,20,0,0,0, 5,-5,-10,0,0,-10,-5,5, 5,10,10,-20,-20,10,10,5, 0,0,0,0,0,0,0,0],
+  N: [-50,-40,-30,-30,-30,-30,-40,-50, -40,-20,0,0,0,0,-20,-40, -30,0,10,15,15,10,0,-30, -30,5,15,20,20,15,5,-30, -30,0,15,20,20,15,0,-30, -30,5,10,15,15,10,5,-30, -40,-20,0,5,5,0,-20,-40, -50,-40,-30,-30,-30,-30,-40,-50],
+  B: [-20,-10,-10,-10,-10,-10,-10,-20, -10,0,0,0,0,0,0,-10, -10,0,5,10,10,5,0,-10, -10,5,5,10,10,5,5,-10, -10,0,10,10,10,10,0,-10, -10,10,10,10,10,10,10,-10, -10,5,0,0,0,0,5,-10, -20,-10,-10,-10,-10,-10,-10,-20],
+  R: [0,0,0,0,0,0,0,0, 5,10,10,10,10,10,10,5, ...rep([-5,0,0,0,0,0,0,-5], 5), 0,0,0,5,5,0,0,0],
+  Q: [-20,-10,-10,-5,-5,-10,-10,-20, -10,0,0,0,0,0,0,-10, -10,0,5,5,5,5,0,-10, -5,0,5,5,5,5,0,-5, 0,0,5,5,5,5,0,-5, -10,5,5,5,5,5,0,-10, -10,0,5,0,0,0,0,-10, -20,-10,-10,-5,-5,-10,-10,-20]
+};
+const KMG = [...rep([-30,-40,-40,-50,-50,-40,-40,-30], 4), -20,-30,-30,-40,-40,-30,-30,-20, -10,-20,-20,-20,-20,-20,-20,-10, 20,20,0,0,0,0,20,20, 20,30,10,0,0,10,30,20];
+const KEG = [-50,-40,-30,-20,-20,-30,-40,-50, -30,-20,-10,0,0,-10,-20,-30, -30,-10,20,30,30,20,-10,-30, -30,-10,30,40,40,30,-10,-30, -30,-10,30,40,40,30,-10,-30, -30,-10,20,30,30,20,-10,-30, -30,-30,0,0,0,0,-30,-30, -50,-30,-30,-30,-30,-30,-30,-50];
+const PSQ = {K: new Array(64).fill(0), k: new Array(64).fill(0)};
+for (const p in PST) { PSQ[p] = PST[p].map((v, s) => VAL[p] + v); PSQ[p.toLowerCase()] = PST[p].map((v, s) => VAL[p] + PST[p][s ^ 56]); }
+
+let st, nodes, deadline, killers;
+const PASS = [-1, -1, "", 1];
+const name = s => "abcdefgh"[s & 7] + (8 - (s >> 3));
+
+function setup(fen, used, n) {
+  const p = fen.split(" "), b = [];
+  for (const r of p[0].split("/")) for (const ch of r) { if (ch >= "1" && ch <= "8") for (let i = 0; i < +ch; i++) b.push("."); else b.push(ch); }
+  let cast = 0; if (p[2].includes("K")) cast |= 1; if (p[2].includes("Q")) cast |= 2; if (p[2].includes("k")) cast |= 4; if (p[2].includes("q")) cast |= 8;
+  const ch = new Uint8Array(64); for (const s of used) ch[s] = 1;
+  st = {b, w: p[1] === "w", cast, ep: p[3] === "-" ? -1 : (8 - +p[3][1]) * 8 + "abcdefgh".indexOf(p[3][0]), half: +p[4] || 0, kp: [b.indexOf("K"), b.indexOf("k")], ch, cn: n};
+}
+function att(sq, bw) {
+  const b = st.b, P = bw ? "P" : "p", N = bw ? "N" : "n", B = bw ? "B" : "b", R = bw ? "R" : "r", Q = bw ? "Q" : "q", K = bw ? "K" : "k";
+  for (const s of PA[bw ? 1 : 0][sq]) if (b[s] === P) return true;
+  for (const s of NT[sq]) if (b[s] === N) return true;
+  for (const s of KT[sq]) if (b[s] === K) return true;
+  for (const ray of OR[sq]) for (const s of ray) { const p = b[s]; if (p !== ".") { if (p === R || p === Q) return true; break; } }
+  for (const ray of DR[sq]) for (const s of ray) { const p = b[s]; if (p !== ".") { if (p === B || p === Q) return true; break; } }
+  return false;
+}
+function castles(s, w, add) {
+  const b = st.b, c = st.cast;
+  if (w && s === 60) {
+    if ((c & 1) && b[61] === "." && b[62] === "." && b[63] === "R" && !att(60, false) && !att(61, false) && !att(62, false)) add([60, 62, "", 0]);
+    if ((c & 2) && b[59] === "." && b[58] === "." && b[57] === "." && b[56] === "R" && !att(60, false) && !att(59, false) && !att(58, false)) add([60, 58, "", 0]);
+  } else if (!w && s === 4) {
+    if ((c & 4) && b[5] === "." && b[6] === "." && b[7] === "r" && !att(4, true) && !att(5, true) && !att(6, true)) add([4, 6, "", 0]);
+    if ((c & 8) && b[3] === "." && b[2] === "." && b[1] === "." && b[0] === "r" && !att(4, true) && !att(3, true) && !att(2, true)) add([4, 2, "", 0]);
+  }
+}
+function pseudo(caps) {
+  const b = st.b, w = st.w, ch = st.ch, chain = st.cn > 0, moves = [], add = m => moves.push(m);
+  for (let s = 0; s < 64; s++) {
+    const p = b[s];
+    if (p === "." || (p === p.toUpperCase()) !== w || (chain && ch[s])) continue;
+    const t = p.toUpperCase();
+    if (t === "P") {
+      const r = s >> 3, c = s & 7, dr = w ? -1 : 1, pr = w ? 0 : 7, sr = w ? 6 : 1, f = s + dr * 8, promos = caps ? "Q" : "QRBN";
+      if (b[f] === ".") {
+        if (r + dr === pr) for (const x of promos) add([s, f, x, 0]);
+        else if (!caps) { add([s, f, "", 0]); if (r === sr && b[f + dr * 8] === ".") add([s, f + dr * 8, "", 0]); }
+      }
+      for (const dc of [-1, 1]) {
+        const cc = c + dc; if (cc < 0 || cc > 7) continue;
+        const to = f + dc, q = b[to];
+        if (q === ".") { if (to === st.ep) add([s, to, "", 0]); }
+        else if ((q === q.toUpperCase()) !== w) { if (r + dr === pr) for (const x of promos) add([s, to, x, 0]); else add([s, to, "", 0]); }
+      }
+    } else if (t === "N" || t === "K") {
+      for (const to of (t === "N" ? NT : KT)[s]) { const q = b[to]; if (q === ".") { if (!caps) add([s, to, "", 0]); } else if ((q === q.toUpperCase()) !== w) add([s, to, "", 0]); }
+      if (t === "K" && !caps) castles(s, w, add);
+    } else {
+      const rays = (t !== "B" ? OR[s] : []).concat(t !== "R" ? DR[s] : []);
+      for (const ray of rays) for (const to of ray) { const q = b[to]; if (q === ".") { if (!caps) add([s, to, "", 0]); } else { if ((q === q.toUpperCase()) !== w) add([s, to, "", 0]); break; } }
+    }
+  }
+  if (chain && !caps) moves.push(PASS);
+  return moves;
+}
+function make(m) {
+  const [fr, to, promo, ps] = m, b = st.b, w = st.w, side = w ? 0 : 1;
+  const u = [b.slice(), st.cast, st.ep, st.half, st.kp.slice(), st.w, st.ch.slice(), st.cn];
+  if (ps) { st.w = !w; st.ch.fill(0); st.cn = 0; st.ep = -1; return u; }
+  const p = b[fr], t = p.toUpperCase(); let victim = b[to], cap = victim !== ".", nep = -1;
+  if (t === "P") {
+    if (to === st.ep && !cap && (fr & 7) !== (to & 7)) { const cs = to + (w ? 8 : -8); victim = b[cs]; b[cs] = "."; cap = true; }
+    if (Math.abs(to - fr) === 16) nep = (fr + to) >> 1;
+  }
+  b[to] = promo ? (w ? promo : promo.toLowerCase()) : p; b[fr] = ".";
+  if (t === "K") {
+    st.kp[side] = to;
+    if (Math.abs(to - fr) === 2) { if (to > fr) { b[fr + 1] = b[fr + 3]; b[fr + 3] = "."; } else { b[fr - 1] = b[fr - 4]; b[fr - 4] = "."; } }
+  }
+  st.ep = nep; st.half = (cap || t === "P") ? 0 : st.half + 1; st.cast &= CM[fr] & CM[to];
+  let bonus = false;
+  if (cap) { st.cn++; if (!att(st.kp[1 - side], w)) bonus = true; }      // check ends the chain
+  if (bonus) st.ch[to] = 1; else { st.w = !w; st.ch.fill(0); st.cn = 0; }
+  return u;
+}
+function unmake(u) { st.b = u[0]; st.cast = u[1]; st.ep = u[2]; st.half = u[3]; st.kp = u[4]; st.w = u[5]; st.ch = u[6]; st.cn = u[7]; }
+function legal() {
+  const res = [], w = st.w, side = w ? 0 : 1;
+  for (const m of pseudo(false)) { const u = make(m); if (!att(st.kp[side], !w)) res.push(m); unmake(u); }
+  return res;
+}
+function evaluate() {
+  const b = st.b; let sc = 0, ph = 0;
+  for (let s = 0; s < 64; s++) { const p = b[s]; if (p === ".") continue; ph += PHASE[p] || 0; if (p !== "K" && p !== "k") sc += (p === p.toUpperCase() ? 1 : -1) * PSQ[p][s]; }
+  const kt = ph <= 8 ? KEG : KMG; sc += kt[st.kp[0]] - kt[st.kp[1] ^ 56];
+  return st.w ? sc : -sc;
+}
+function order(moves, ply) {
+  const b = st.b, k = killers[ply] || [null, null];
+  const key = m => {
+    if (m[3]) return -1;
+    const v = b[m[1]];
+    if (v !== ".") return 10000 + 10 * VAL[v] - VAL[b[m[0]]];
+    if (m[2]) return 9000;
+    return (k[0] && k[0][0] === m[0] && k[0][1] === m[1]) || (k[1] && k[1][0] === m[0] && k[1][1] === m[1]) ? 5000 : 0;
+  };
+  const sc = new Map(moves.map(m => [m, key(m)])); moves.sort((a, c) => sc.get(c) - sc.get(a));
+}
+const tick = () => { if ((++nodes & 1023) === 0 && Date.now() > deadline) throw TIMEOUT; };
+function quiesce(alpha, beta, qd) {
+  tick();
+  const stand = evaluate(); if (stand >= beta) return stand; if (stand > alpha) alpha = stand; if (qd >= 8) return stand;
+  const w = st.w, side = w ? 0 : 1, moves = pseudo(true); order(moves, 79);
+  for (const m of moves) {
+    const u = make(m);
+    if (att(st.kp[side], !w)) { unmake(u); continue; }
+    const sc = st.w === w ? quiesce(alpha, beta, qd + 1) : -quiesce(-beta, -alpha, qd + 1);
+    unmake(u);
+    if (sc >= beta) return sc; if (sc > alpha) alpha = sc;
+  }
+  return alpha;
+}
+function negamax(depth, alpha, beta, ply) {
+  tick();
+  if (st.half >= 100) return 0;
+  const w = st.w, side = w ? 0 : 1, inCheck = att(st.kp[side], !w);
+  if (inCheck && ply < 14) depth++;
+  if (depth <= 0) return quiesce(alpha, beta, 0);
+  const moves = pseudo(false); order(moves, ply);
+  let best = -INF, n = 0; const b = st.b;
+  for (const m of moves) {
+    const u = make(m);
+    if (att(st.kp[side], !w)) { unmake(u); continue; }
+    n++;
+    const sc = st.w === w ? negamax(depth - 1, alpha, beta, ply + 1) : -negamax(depth - 1, -beta, -alpha, ply + 1);
+    unmake(u);
+    if (sc > best) best = sc; if (sc > alpha) alpha = sc;
+    if (alpha >= beta) { if (!m[3] && !m[2] && b[m[1]] === "." && ply < 80) { const k = killers[ply]; k[1] = k[0]; k[0] = m; } break; }
+  }
+  return n === 0 ? (inCheck ? -(MATE - ply) : 0) : best;
+}
+function rootSearch(depth, moves, noisy) {
+  const out = [], w = st.w; let alpha = -INF;
+  for (const m of moves) {
+    const u = make(m), same = st.w === w;
+    let sc = noisy ? (same ? negamax(depth - 1, -INF, INF, 1) : -negamax(depth - 1, -INF, INF, 1))
+                   : (same ? negamax(depth - 1, alpha, INF, 1) : -negamax(depth - 1, -INF, -alpha, 1));
+    unmake(u); out.push([sc, m]); if (sc > alpha) alpha = sc;
+  }
+  return out;
+}
+const LV = {1: {d: 2, t: 300, noise: 200}, 2: {d: 4, t: 1000, noise: 30}, 3: {d: 12, t: 2500, noise: 0}, 4: {d: 20, t: 6000, noise: 0}};
+const fmt = m => m[3] ? {pass: true} : {from: name(m[0]), to: name(m[1]), promo: m[2].toLowerCase() || undefined};
+function think(fen, used, n, level) {
+  setup(fen, used, n); const cfg = LV[level] || LV[2];
+  killers = Array.from({length: 82}, () => [null, null]); nodes = 0; deadline = Date.now() + cfg.t;
+  const root = legal(); if (!root.length) return null; if (root.length === 1) return fmt(root[0]);
+  order(root, 79); let scored = root.map(m => [0, m]), depth = 0;
+  try {
+    for (let d = 1; d <= cfg.d; d++) {
+      const res = rootSearch(d, scored.map(x => x[1]), cfg.noise > 0); res.sort((a, c) => c[0] - a[0]); scored = res; depth = d;
+      if (scored[0][0] >= MATE - 50) break;
+    }
+  } catch (e) { if (e !== TIMEOUT) throw e; }
+  if (cfg.noise > 0) { const top = scored[0][0], c = scored.filter(x => x[0] >= top - cfg.noise); return fmt(c[Math.floor(Math.random() * c.length)][1]); }
+  return fmt(scored[0][1]);
+}
+function perft(d) { if (!d) return 1; let n = 0; for (const m of legal()) { const u = make(m); n += perft(d - 1); unmake(u); } return n; }
+if (typeof self !== "undefined" && typeof self.postMessage === "function") self.onmessage = e => { const d = e.data; self.postMessage(think(d.fen, d.used, d.n, d.level)); };
+if (typeof module !== "undefined") module.exports = {think, setup, perft, legal, make, unmake, name, get st() { return st; }};
+</script>
 <script>
 "use strict";
 const firebaseConfig = {
@@ -299,52 +496,29 @@ function undo() {
   g = new Chess(S.fen); sel = null; tg = []; render(); maybeBot();
 }
 
-/* ---------------- bot ---------------- */
-const VAL = {p: 1, n: 3, b: 3, r: 5, q: 9};
-function botPlan() {
-  const me = g.turn(), lvl = +$("lvl").value, out = [];
-  const mat = fen => { let s = 0; for (const ch of fen.split(" ")[0]) { const v = VAL[ch.toLowerCase()]; if (v) s += ch === ch.toLowerCase() ? -v : v; } return me === "w" ? s : -s; };
-  (function rec(fen, used, seq, d) {                      // enumerate whole turns: first move, then capture chains
-    const t = new Chess(fen);
-    let ms = t.moves({verbose: true}).filter(m => !used.includes(m.from));
-    if (used.length) { ms = ms.filter(m => CAP.test(m.flags)); out.push({seq, fen}); }
-    for (const m of ms) {
-      const t2 = new Chess(fen); t2.move(m);
-      const s2 = seq.concat({from: m.from, to: m.to, promo: m.promotion || "q"});
-      if (t2.in_checkmate()) out.push({seq: s2, fen: t2.fen(), mate: 1});
-      else if (CAP.test(m.flags) && !t2.in_check() && d < 3) rec(withTurn(t2.fen(), me), used.concat(m.to), s2, d + 1);
-      else out.push({seq: s2, fen: t2.fen()});
-    }
-  })(g.fen(), [], [], 0);
-  const gain = (fen, used, d) => {                        // opponent's best capture chain
-    const t = new Chess(fen); let best = 0;
-    for (const m of t.moves({verbose: true})) {
-      if (used.includes(m.from) || !CAP.test(m.flags)) continue;
-      let v = VAL[m.captured] || 1; const t2 = new Chess(fen); t2.move(m);
-      if (!t2.in_check() && d < 2) v += gain(withTurn(t2.fen(), t.turn()), used.concat(m.to), d + 1);
-      best = Math.max(best, v);
-    }
-    return best;
-  };
-  out.forEach(p => p.sc = mat(p.fen) + (p.mate ? 1000 : 0) + Math.random() * (lvl === 1 ? 5 : lvl === 2 ? 1 : 0.1));
-  out.sort((a, b) => b.sc - a.sc);
-  if (lvl === 3) { out.slice(0, 14).forEach(p => { if (!p.mate) p.sc -= gain(withTurn(p.fen, opp(me)), [], 0); }); out.sort((a, b) => b.sc - a.sc); }
-  return out[0].seq;
+/* ---------------- bot: alpha-beta engine in a Web Worker (source in #engineSrc) ---------------- */
+let worker = null, botGen = 0;
+const sqIdx = sq => (8 - +sq[1]) * 8 + "abcdefgh".indexOf(sq[0]);
+function engineMove(cb) {
+  if (!worker) worker = new Worker(URL.createObjectURL(new Blob([$("engineSrc").textContent], {type: "text/javascript"})));
+  worker.onmessage = e => cb(e.data);
+  worker.onerror = () => cb(null);
+  worker.postMessage({fen: S.fen, used: S.used.map(sqIdx), n: S.n, level: +$("lvl").value});
 }
 function maybeBot() {
   if (mode !== "bot" || !S || S.over || g.turn() !== botColor || botBusy) return;
   botBusy = true; render();
-  setTimeout(() => runPlan(botPlan(), 0), 500);
-}
-function runPlan(pl, i) {
-  if (!S.over && g.turn() === botColor) {
-    if (i < pl.length) {
-      if (!play(pl[i].from, pl[i].to, pl[i].promo)) { botBusy = false; return; }
-      render(); return setTimeout(() => runPlan(pl, i + 1), 550);
+  const gen = ++botGen;
+  setTimeout(() => engineMove(mv => {
+    if (gen !== botGen || mode !== "bot" || S.over || g.turn() !== botColor) { botBusy = false; render(); return; }
+    let ok = !!mv;
+    if (ok) { if (mv.pass) passTurn(); else ok = play(mv.from, mv.to, mv.promo); }
+    if (!ok) {                                            // safety net if the worker fails
+      const m = g.moves({verbose: true}).find(x => !S.used.includes(x.from));
+      if (m) play(m.from, m.to, m.promotion); else passTurn();
     }
-    if (S.used.length) passTurn();
-  }
-  botBusy = false; render();
+    botBusy = false; render(); maybeBot();                // maybeBot continues a capture chain
+  }), 350);
 }
 
 /* ---------------- rendering ---------------- */
@@ -433,6 +607,7 @@ setInterval(() => {                                   // clock ticker + timeout 
 
 /* ---------------- game setup ---------------- */
 function newGame(m) {
+  botGen++; if (worker) { worker.terminate(); worker = null; }
   mode = m || mode; S = fresh(); g = new Chess(); sel = null; tg = []; undoStack = []; botBusy = false;
   const pick = $("col").value, c = pick === "r" ? (Math.random() < .5 ? "w" : "b") : pick;
   if (mode === "bot") { botColor = opp(c); flip = c === "b"; }
